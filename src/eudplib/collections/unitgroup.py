@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Literal, overload
 
 from ..core import (
@@ -17,6 +17,7 @@ from ..core import (
     Deaths,
     DeathsX,
     EUDVariable,
+    EUDVArray,
     EUDXVariable,
     Exactly,
     Forward,
@@ -41,9 +42,30 @@ from ..ctrlstru.loopblock import _unsafe_whilenot
 from ..localize import _
 from ..memio.modcurpl import f_setcurpl2cpcache
 from ..scdata import CurrentPlayer
-from ..utils import EPD, EPError, EUDPeekBlock, ep_assert
+from ..utils import EPD, EPError, EUDPeekBlock, ep_assert, unProxy
 
 _assign_helper = EUDVariable()
+
+
+class _GroupField:
+    def __init__(self, capacity, kind, default):
+        self.kind = kind
+        self.default = default
+        self.values = EUDVArray(capacity)([default] * capacity)
+
+    def read(self, index):
+        value = self.values[index]
+        return self.kind.cast(value) if self.kind is not None else value
+
+    def write(self, index, value):
+        raw = unProxy(value)
+        if self.kind is not None and not (isinstance(raw, int) and raw == 0):
+            value = self.kind.cast(value)
+        self.values[index] = value
+
+    def copy(self, source, destination):
+        # Moving stored values does not construct or cast a static reference.
+        self.values[destination] = self.values[source]
 
 
 class UnitGroup:
@@ -94,7 +116,38 @@ class UnitGroup:
     ```
     """
 
-    def __init__(self, capacity: int) -> None:
+    _fields_: Sequence[str | tuple] = ()
+
+    def __init__(self, capacity: int, *, fields: Sequence[str | tuple] | None = None) -> None:
+        self._extra_fields = {}
+        schema = self._fields_ if fields is None else fields
+        for spec in schema:
+            kind, default = None, 0
+            if isinstance(spec, str):
+                name = spec
+            else:
+                ep_assert(isinstance(spec, tuple) and 2 <= len(spec) <= 3,
+                          'UnitGroup fields must be names, (name, default), or (name, type, default)')
+                name = spec[0]
+                if len(spec) == 3:
+                    kind, default = spec[1:]
+                elif hasattr(spec[1], 'cast'):
+                    kind = spec[1]
+                else:
+                    default = spec[1]
+            ep_assert(isinstance(name, str) and name.isidentifier() and not name.startswith('_'),
+                      f'Invalid UnitGroup field name: {name}')
+            ep_assert(not hasattr(_CpHelper, name) and name not in ('offset', 'get_epd', 'dying'),
+                      f'UnitGroup field conflicts with entry member: {name}')
+            ep_assert(name not in self._extra_fields, f'Duplicate UnitGroup field: {name}')
+            ep_assert(kind is None or callable(getattr(kind, 'cast', None)),
+                      f'Invalid type for UnitGroup field: {name}')
+            raw = unProxy(default)
+            ep_assert(isinstance(raw, (int, ConstExpr)),
+                      f'UnitGroup field defaults must be compile-time constants: {name}')
+            if kind is not None and not (isinstance(raw, int) and raw == 0):
+                default = kind.cast(default)
+            self._extra_fields[name] = _GroupField(capacity, kind, default)
         self.capacity = capacity
         self.loopvar = EUDXVariable(EPD(0x6509B0), SetTo, 0)
         varray = _InternalVArray(capacity)(
@@ -110,7 +163,15 @@ class UnitGroup:
     def length(self):
         return self._length
 
-    def add(self, unit_epd) -> None:
+    def add(self, unit_epd, *field_values, **field_kwargs) -> None:
+        fields = self._extra_fields
+        ep_assert(len(field_values) <= len(fields), 'Too many UnitGroup field values')
+        names = tuple(fields)
+        initial = dict(zip(names, field_values))
+        for name, value in field_kwargs.items():
+            ep_assert(name in fields, f'Unknown UnitGroup field: {name}')
+            ep_assert(name not in initial, f'Duplicate UnitGroup field value: {name}')
+            initial[name] = value
         if IsEUDVariable(unit_epd):
             # Occupy 2T, Run 4T 10A
             SeqCompute(
@@ -124,6 +185,7 @@ class UnitGroup:
                     (None, None, unit_epd),
                 ]
             )
+
             SeqCompute([(unit_epd, Add, -(0x4C // 4))])
         else:
             # Occupy 1T, Run 4T 9A
@@ -138,6 +200,11 @@ class UnitGroup:
                     (None, None, _assign_helper),
                 ]
             )
+
+        if fields:
+            slot = self.capacity - self._length
+            for name, field in fields.items():
+                field.write(slot, initial.get(name, field.default))
 
 
 class _CPLoop:
@@ -161,6 +228,8 @@ class _CPLoop:
                 SetNextPtr(loopvar.GetVTable(), check_death),
             ],
         )
+        fields = self._parent._extra_fields
+        index = capacity - self._parent._length if fields else None
 
         def reset_cp() -> None:
             PushTriggerScope()
@@ -181,6 +250,11 @@ class _CPLoop:
         if _unsafe_whilenot()(Memory(loopstart, AtLeast, varray + 72 * capacity)):
             block = EUDPeekBlock("whileblock")[1]
             PushTriggerScope()  # remove entry
+            remove_fields = NextTrigger() if fields else None
+            if fields:
+                source = capacity - self._parent._length
+                for field in fields.values():
+                    field.copy(source, index)
             remove_end = Forward()
             remove_start = RawTrigger(
                 nextptr=trg.GetVTable(),
@@ -217,10 +291,13 @@ class _CPLoop:
                 return ret
 
             # EUDIf()(DeathsX(CurrentPlayer, Exactly, 0, 0, 0xFF00)):
-            yield _CpHelper(0x4C // 4, reset_cp, remove_start, get_epd)
+            yield _CpHelper(0x4C // 4, reset_cp, remove_fields if fields else remove_start,
+                            get_epd, fields, index)
             if not block["contpoint"].IsSet():
                 EUDSetContinuePoint()
             DoActions(SetMemory(loopstart, Add, 72), SetMemory(pos, Add, 18))
+            if fields:
+                DoActions(index.AddNumber(1))
         EUDEndWhile()
 
         f_setcurpl2cpcache()
@@ -235,6 +312,8 @@ class _CpHelper:
         resetf: Callable[[], None],
         remove: RawTrigger,
         epdf: Callable[[], EUDVariable],
+        fields=None,
+        index=None,
     ) -> None:
         self.offset = offset
         self._reset = resetf
@@ -242,6 +321,21 @@ class _CpHelper:
         self.get_epd = epdf
         self.dying = _Dying(self)
         self._in_dying_block = False
+        self._fields = fields or {}
+        self._index = index
+
+    def __getattr__(self, name):
+        fields = self.__dict__.get('_fields', {})
+        if name not in fields:
+            raise AttributeError(name)
+        return fields[name].read(self._index)
+
+    def __setattr__(self, name, value):
+        fields = self.__dict__.get('_fields', {})
+        if name in fields:
+            fields[name].write(self._index, value)
+        else:
+            object.__setattr__(self, name, value)
 
     def remove(self) -> None:
         if self._in_dying_block:
